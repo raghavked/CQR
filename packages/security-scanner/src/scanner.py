@@ -1,176 +1,242 @@
 """
-CQR Security Scanner — KG path traversal and vulnerability detection.
-Runs automatically after every agent edit and on manual trigger.
-Results are emitted as security.alert WebSocket events and stored for reporting.
+CQR Security Scanner — KG graph path traversal orchestrator.
+
+This module replaces the previous regex-based scanner with a true graph
+path traversal approach. It:
+  1. Fetches all nodes and CALLS/IMPORTS edges for a project from the KG engine.
+  2. Runs the path traversal engine (traversal.py) to find unvalidated taint paths.
+  3. Runs structural checks (orphaned imports, circular deps, hardcoded creds).
+  4. Classifies all results into named PDR scan patterns (patterns.py).
+  5. Stores findings in memory (to be replaced with Postgres in CP-3).
+
+The scan is intentionally stateless — each call to scan_project() fetches a
+fresh snapshot from the KG and returns the current findings.
 """
 from __future__ import annotations
 
 import logging
 import os
-import re
-import uuid
 from datetime import datetime
 from typing import Any
 
 import httpx
 
+from .patterns import (
+    check_circular_dependencies,
+    check_hardcoded_credentials,
+    check_orphaned_imports,
+    classify_traversal_result,
+)
+from .traversal import scan_graph
+
 logger = logging.getLogger(__name__)
 
 KG_ENGINE_URL = os.getenv("KG_ENGINE_URL", "http://localhost:8001")
 
-# ---------------------------------------------------------------------------
-# Vulnerability scan patterns
-# ---------------------------------------------------------------------------
-
-# Each pattern: (name, severity, description, detection_fn)
-# detection_fn(node: dict) -> bool
-
-_HARDCODED_SECRET_PATTERNS = [
-    re.compile(r'(?i)(password|passwd|secret|api_key|apikey|token|auth)\s*=\s*["\'][^"\']{6,}["\']'),
-    re.compile(r'(?i)(?:sk-|ghp_|xoxb-|AKIA)[A-Za-z0-9]{10,}'),
-]
-
-_SQL_INJECTION_PATTERNS = [
-    re.compile(r'(?i)(execute|query|cursor\.execute)\s*\(\s*["\'].*?\+'),
-    re.compile(r'(?i)f["\'].*?SELECT.*?{.*?}'),
-    re.compile(r'(?i)%\s*\(.*?\)\s*%\s*["\'].*?SELECT'),
-]
-
-_PATH_TRAVERSAL_PATTERNS = [
-    re.compile(r'(?i)open\s*\(\s*.*?\+'),
-    re.compile(r'(?i)os\.path\.join\s*\(.*?request'),
-]
-
-_COMMAND_INJECTION_PATTERNS = [
-    re.compile(r'(?i)(os\.system|subprocess\.call|subprocess\.run)\s*\(.*?\+'),
-    re.compile(r'(?i)eval\s*\(.*?input'),
-]
-
-
-def _check_hardcoded_secret(node: dict[str, Any]) -> bool:
-    """Detect hardcoded credentials in a node's code snippet."""
-    snippet = node.get("properties", {}).get("signature", "") + \
-              node.get("properties", {}).get("docstring", "")
-    for pattern in _HARDCODED_SECRET_PATTERNS:
-        if pattern.search(snippet):
-            return True
-    return False
-
-
-def _check_sql_injection(node: dict[str, Any]) -> bool:
-    """Detect SQL injection patterns in a function node."""
-    snippet = node.get("properties", {}).get("signature", "")
-    for pattern in _SQL_INJECTION_PATTERNS:
-        if pattern.search(snippet):
-            return True
-    return False
-
-
-def _check_path_traversal(node: dict[str, Any]) -> bool:
-    """Detect path traversal patterns in a function node."""
-    snippet = node.get("properties", {}).get("signature", "")
-    for pattern in _PATH_TRAVERSAL_PATTERNS:
-        if pattern.search(snippet):
-            return True
-    return False
-
-
-def _check_command_injection(node: dict[str, Any]) -> bool:
-    """Detect command injection patterns in a function node."""
-    snippet = node.get("properties", {}).get("signature", "")
-    for pattern in _COMMAND_INJECTION_PATTERNS:
-        if pattern.search(snippet):
-            return True
-    return False
-
-
-# Pattern registry: (pattern_name, severity, description, check_fn)
-SCAN_PATTERNS = [
-    ("hardcoded_secret", "critical", "Hardcoded credential or API key detected", _check_hardcoded_secret),
-    ("sql_injection", "high", "Potential SQL injection via string concatenation", _check_sql_injection),
-    ("path_traversal", "high", "Potential path traversal via unsanitised input", _check_path_traversal),
-    ("command_injection", "high", "Potential command injection via unsanitised input", _check_command_injection),
-]
-
-# In-memory finding store
-# TODO(AMBIGUITY): Replace with Postgres-backed store in CP-3
+# In-memory finding store — keyed by project_id
+# TODO(CP-3): Replace with Postgres-backed persistent store
 _findings: dict[str, list[dict[str, Any]]] = {}
+_scan_history: dict[str, list[dict[str, Any]]] = {}
 
 
-async def scan_project(project_id: str, task_id: str | None = None) -> list[dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# KG data fetching
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_project_graph(project_id: str) -> tuple[list[dict], list[dict]]:
     """
-    Scan all KG nodes for a project against all vulnerability patterns.
-    Returns a list of SecurityFinding dicts.
+    Fetch all nodes and edges for a project from the KG engine.
+    Returns (nodes, edges).
     """
-    new_findings: list[dict[str, Any]] = []
-
-    # Fetch all function nodes from KG via search (empty query returns all)
     async with httpx.AsyncClient(timeout=30.0) as client:
+        # Fetch all nodes
         try:
-            response = await client.get(
-                f"{KG_ENGINE_URL}/kg/search",
-                params={"project_id": project_id, "q": ""},
+            nodes_resp = await client.get(
+                f"{KG_ENGINE_URL}/kg/nodes",
+                params={"project_id": project_id},
             )
-            response.raise_for_status()
-            nodes = response.json()
+            nodes_resp.raise_for_status()
+            nodes = nodes_resp.json()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("KG search failed during scan: %s", exc)
+            logger.warning("KG nodes fetch failed for project %s: %s", project_id, exc)
             nodes = []
 
-        # For each node, fetch full details and run patterns
-        for node_stub in nodes:
-            node_id = node_stub.get("id")
-            if not node_id:
-                continue
+        # Fetch all edges
+        try:
+            edges_resp = await client.get(
+                f"{KG_ENGINE_URL}/kg/edges",
+                params={"project_id": project_id},
+            )
+            edges_resp.raise_for_status()
+            edges = edges_resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("KG edges fetch failed for project %s: %s", project_id, exc)
+            edges = []
+
+    return nodes, edges
+
+
+async def _fetch_nodes_by_ids(
+    project_id: str,
+    node_ids: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Fetch a specific set of nodes (and their immediate neighbourhood edges)
+    from the KG engine. Used for post-agent-edit partial scans.
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        nodes: list[dict] = []
+        edges: list[dict] = []
+
+        for node_id in node_ids:
             try:
-                node_response = await client.get(
-                    f"{KG_ENGINE_URL}/kg/node/{node_id}",
-                    params={"project_id": project_id},
+                resp = await client.get(
+                    f"{KG_ENGINE_URL}/kg/subgraph",
+                    params={"project_id": project_id, "node_id": node_id, "hops": 2},
                 )
-                node_response.raise_for_status()
-                node = node_response.json()
-            except Exception:  # noqa: BLE001
-                node = node_stub
+                resp.raise_for_status()
+                subgraph = resp.json()
+                nodes.extend(subgraph.get("nodes", []))
+                edges.extend(subgraph.get("edges", []))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Subgraph fetch failed for node %s: %s", node_id, exc)
 
-            for pattern_name, severity, description, check_fn in SCAN_PATTERNS:
-                if check_fn(node):
-                    finding = {
-                        "id": str(uuid.uuid4()),
-                        "project_id": project_id,
-                        "pattern": pattern_name,
-                        "severity": severity,
-                        "node_path": [node_id],
-                        "description": description,
-                        "suggested_fix": _suggest_fix(pattern_name),
-                        "detected_at": datetime.utcnow().isoformat(),
-                        "resolved": False,
-                        "task_id": task_id,
-                    }
-                    new_findings.append(finding)
-                    logger.warning(
-                        '{"event": "security_finding", "project_id": "%s", "pattern": "%s", "severity": "%s", "node_id": "%s"}',
-                        project_id,
-                        pattern_name,
-                        severity,
-                        node_id,
-                    )
+        # Deduplicate by id
+        seen_nodes: set[str] = set()
+        unique_nodes = []
+        for n in nodes:
+            if n["id"] not in seen_nodes:
+                seen_nodes.add(n["id"])
+                unique_nodes.append(n)
 
-    # Store findings
-    _findings.setdefault(project_id, []).extend(new_findings)
-    return new_findings
+        seen_edges: set[tuple] = set()
+        unique_edges = []
+        for e in edges:
+            key = (e.get("from_id"), e.get("to_id"), e.get("edge_type"))
+            if key not in seen_edges:
+                seen_edges.add(key)
+                unique_edges.append(e)
+
+    return unique_nodes, unique_edges
+
+
+# ---------------------------------------------------------------------------
+# Core scan logic
+# ---------------------------------------------------------------------------
+
+
+def _run_scan(
+    project_id: str,
+    nodes: list[dict],
+    edges: list[dict],
+    task_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Run all scan passes over the provided nodes and edges.
+    Returns a list of SecurityFinding dicts.
+    """
+    findings: list[dict[str, Any]] = []
+
+    # --- Pass 1: Path traversal (taint flow analysis) ---
+    traversal_results = scan_graph(nodes, edges)
+    for result in traversal_results:
+        finding = classify_traversal_result(result, project_id)
+        if finding:
+            if task_id:
+                finding["task_id"] = task_id
+            findings.append(finding)
+            logger.warning(
+                '{"event": "security_finding", "project_id": "%s", "pattern": "%s", '
+                '"severity": "%s", "path_length": %d}',
+                project_id,
+                finding["pattern"],
+                finding["severity"],
+                len(finding["node_path"]),
+            )
+
+    # --- Pass 2: Hardcoded credentials (structural) ---
+    cred_findings = check_hardcoded_credentials(nodes, project_id)
+    for f in cred_findings:
+        if task_id:
+            f["task_id"] = task_id
+    findings.extend(cred_findings)
+
+    # --- Pass 3: Orphaned imports (structural) ---
+    orphan_findings = check_orphaned_imports(nodes, edges, project_id)
+    for f in orphan_findings:
+        if task_id:
+            f["task_id"] = task_id
+    findings.extend(orphan_findings)
+
+    # --- Pass 4: Circular dependencies (structural) ---
+    circular_findings = check_circular_dependencies(nodes, edges, project_id)
+    for f in circular_findings:
+        if task_id:
+            f["task_id"] = task_id
+    findings.extend(circular_findings)
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Public scan API
+# ---------------------------------------------------------------------------
+
+
+async def scan_project(
+    project_id: str,
+    task_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Run a full scan of a project's KG.
+    Fetches all nodes and edges, runs all 4 scan passes, stores and returns findings.
+    """
+    nodes, edges = await _fetch_project_graph(project_id)
+    findings = _run_scan(project_id, nodes, edges, task_id)
+
+    # Replace stored findings for this project
+    _findings[project_id] = findings
+
+    # Append to scan history
+    _scan_history.setdefault(project_id, []).append({
+        "scanned_at": datetime.utcnow().isoformat(),
+        "findings_count": len(findings),
+        "task_id": task_id,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+    })
+
+    return findings
+
+
+async def scan_nodes(
+    project_id: str,
+    node_ids: list[str],
+    task_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Run a targeted scan on a specific set of node IDs and their 2-hop neighbourhood.
+    Used after agent edits to avoid re-scanning the entire project.
+    """
+    nodes, edges = await _fetch_nodes_by_ids(project_id, node_ids)
+    findings = _run_scan(project_id, nodes, edges, task_id)
+
+    # Merge into stored findings (replace findings for the same node paths)
+    existing = _findings.get(project_id, [])
+    affected_ids = set(node_ids)
+    # Keep findings that don't overlap with the re-scanned nodes
+    kept = [f for f in existing if not any(n in affected_ids for n in f.get("node_path", []))]
+    _findings[project_id] = kept + findings
+
+    return findings
 
 
 def get_findings(project_id: str) -> list[dict[str, Any]]:
-    """Return all stored security findings for a project."""
+    """Return the latest stored findings for a project."""
     return _findings.get(project_id, [])
 
 
-def _suggest_fix(pattern_name: str) -> str:
-    """Return a suggested fix description for a known vulnerability pattern."""
-    fixes = {
-        "hardcoded_secret": "Move credentials to environment variables and reference via os.environ.get(). Never commit secrets to source control.",
-        "sql_injection": "Use parameterised queries (e.g., cursor.execute('SELECT ... WHERE id = %s', (user_id,))) instead of string concatenation.",
-        "path_traversal": "Validate and sanitise file paths. Use os.path.realpath() and verify the resolved path is within the expected directory.",
-        "command_injection": "Avoid passing user input to shell commands. Use subprocess with a list of arguments (not shell=True) and validate all inputs.",
-    }
-    return fixes.get(pattern_name, "Review and remediate the flagged code pattern.")
+def get_scan_history(project_id: str) -> list[dict[str, Any]]:
+    """Return the scan history for a project (timestamps, counts, task IDs)."""
+    return _scan_history.get(project_id, [])

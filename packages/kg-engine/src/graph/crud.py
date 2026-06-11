@@ -322,6 +322,61 @@ def get_env_refs(conn: kuzu.Connection, project_id: str, key_name: str) -> list[
     return results
 
 
+def get_all_nodes(conn: kuzu.Connection, project_id: str) -> list[dict[str, Any]]:
+    """
+    Return all nodes for a project across all node types.
+    Used by the Security Scanner to build the full graph for path traversal.
+    Each returned dict has: id, type, properties.
+    """
+    all_nodes: list[dict[str, Any]] = []
+    for node_type in ("File", "Function", "Class", "Import", "Variable", "EnvRef"):
+        try:
+            result = conn.execute(
+                f"MATCH (n:{node_type} {{project_id: $project_id}}) RETURN n.id",
+                {"project_id": project_id},
+            )
+            while result.has_next():
+                row = result.get_next()
+                node_id = row[0]
+                node = get_node(conn, project_id, node_id)
+                if node:
+                    all_nodes.append(node)
+        except Exception:  # noqa: BLE001
+            continue
+    return all_nodes
+
+
+def get_all_edges(conn: kuzu.Connection, project_id: str) -> list[dict[str, Any]]:
+    """
+    Return all edges for a project as {from_id, to_id, edge_type} dicts.
+    Used by the Security Scanner to build the adjacency map for traversal.
+    Covers CALLS, IMPORTS, DEFINES, REFERENCES, and MODIFIED_BY_AGENT edges.
+    """
+    all_edges: list[dict[str, Any]] = []
+    edge_types = ("CALLS", "IMPORTS", "DEFINES", "REFERENCES", "MODIFIED_BY_AGENT")
+    for edge_type in edge_types:
+        try:
+            result = conn.execute(
+                f"""
+                MATCH (a)-[r:{edge_type}]->(b)
+                WHERE a.project_id = $project_id
+                RETURN a.id, b.id
+                """,
+                {"project_id": project_id},
+            )
+            while result.has_next():
+                row = result.get_next()
+                if row[0] and row[1]:
+                    all_edges.append({
+                        "from_id": row[0],
+                        "to_id": row[1],
+                        "edge_type": edge_type,
+                    })
+        except Exception:  # noqa: BLE001
+            continue
+    return all_edges
+
+
 def get_call_chain(conn: kuzu.Connection, project_id: str, fn_id: str) -> dict[str, Any]:
     """Return the full call chain upstream and downstream of a function."""
     upstream: list[dict] = []

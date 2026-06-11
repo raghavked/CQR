@@ -12,6 +12,8 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from .graph.crud import (
+    get_all_edges,
+    get_all_nodes,
     get_call_chain,
     get_env_refs,
     get_node,
@@ -129,6 +131,30 @@ async def call_chain(
     """Return the full call chain upstream and downstream of a function node."""
     conn = get_connection(project_id)
     return get_call_chain(conn, project_id, fn_id)
+
+
+@app.get("/kg/nodes", tags=["kg"])
+async def all_nodes(
+    project_id: str = Query(...),
+) -> list[dict[str, Any]]:
+    """
+    Return all nodes for a project.
+    Used by the Security Scanner to fetch the full graph for path traversal.
+    """
+    conn = get_connection(project_id)
+    return get_all_nodes(conn, project_id)
+
+
+@app.get("/kg/edges", tags=["kg"])
+async def all_edges(
+    project_id: str = Query(...),
+) -> list[dict[str, Any]]:
+    """
+    Return all edges for a project as {from_id, to_id, edge_type} dicts.
+    Used by the Security Scanner to build the adjacency map for traversal.
+    """
+    conn = get_connection(project_id)
+    return get_all_edges(conn, project_id)
 
 
 @app.post("/kg/mark-agent-edit", tags=["kg"])
