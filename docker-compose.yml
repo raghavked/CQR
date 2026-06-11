@@ -1,0 +1,127 @@
+version: "3.8"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Infrastructure
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: ankane/pgvector:v0.5.1
+    container_name: cqr-postgres
+    environment:
+      POSTGRES_USER: cqr
+      POSTGRES_PASSWORD: cqr
+      POSTGRES_DB: cqr
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cqr -d cqr"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: cqr-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # CQR Backend Services
+  # ---------------------------------------------------------------------------
+  orchestration:
+    build:
+      context: .
+      dockerfile: packages/orchestration/Dockerfile
+    container_name: cqr-orchestration
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - kg-engine
+      - lsm-layer
+      - execution-env
+      - vault
+      - agent-bridge
+      - security-scanner
+
+  kg-engine:
+    build:
+      context: .
+      dockerfile: packages/kg-engine/Dockerfile
+    container_name: cqr-kg-engine
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    volumes:
+      - kg_data:/tmp/cqr-kg
+
+  lsm-layer:
+    build:
+      context: .
+      dockerfile: packages/lsm-layer/Dockerfile
+    container_name: cqr-lsm-layer
+    ports:
+      - "8002:8002"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  execution-env:
+    build:
+      context: .
+      dockerfile: packages/execution-env/Dockerfile
+    container_name: cqr-execution-env
+    ports:
+      - "8003:8003"
+    env_file:
+      - .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # Required to spawn sibling containers
+      - cqr_workspaces:/tmp/cqr-workspaces
+
+  vault:
+    build:
+      context: .
+      dockerfile: packages/vault/Dockerfile
+    container_name: cqr-vault
+    ports:
+      - "8004:8004"
+    env_file:
+      - .env
+
+  agent-bridge:
+    build:
+      context: .
+      dockerfile: packages/agent-bridge/Dockerfile
+    container_name: cqr-agent-bridge
+    ports:
+      - "8005:8005"
+    env_file:
+      - .env
+
+  security-scanner:
+    build:
+      context: .
+      dockerfile: packages/security-scanner/Dockerfile
+    container_name: cqr-security-scanner
+    ports:
+      - "8006:8006"
+    env_file:
+      - .env
+
+volumes:
+  postgres_data:
+  kg_data:
+  cqr_workspaces:
