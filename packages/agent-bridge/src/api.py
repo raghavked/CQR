@@ -95,8 +95,9 @@ async def dispatch(body: DispatchRequest) -> dict[str, Any]:
     # 2. Format messages
     messages = format_prompt_messages(context)
 
-    # 3. Extract savings_vs_raw from assembled context
+    # 3. Extract context metadata for token usage enrichment
     savings_vs_raw: float = context.get("savings_vs_raw", 0.0)
+    context_node_count: int = len(context.get("kg_context", {}).get("nodes", []))
 
     # 4. Dispatch to selected LLM — api_key used here and destroyed after call
     if agent == "claude":
@@ -116,7 +117,17 @@ async def dispatch(body: DispatchRequest) -> dict[str, Any]:
     else:
         raise HTTPException(status_code=400, detail=f"Unknown agent: {body.agent}")
 
-    # 5. Flag rejected responses
+    # 5. Enrich token_usage with context_node_count and prompt/completion aliases
+    if isinstance(result.get("token_usage"), dict):
+        tu = result["token_usage"]
+        tu["context_node_count"] = context_node_count
+        tu["prompt_tokens"] = tu.get("context_tokens", 0)
+        tu["completion_tokens"] = tu.get("response_tokens", 0)
+        # Also surface raw_total_tokens and context_tokens from assembler
+        tu["raw_total_tokens"] = context.get("raw_total_tokens", 0)
+        result["token_usage"] = tu
+
+    # 6. Flag rejected responses
     if result.get("flagged"):
         logger.warning(
             '{"event": "agent_response_flagged", "task_id": "%s", "reason": "%s"}',

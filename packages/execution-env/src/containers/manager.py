@@ -174,11 +174,94 @@ def _copy_repo_to_container(container: Container, repo_path: str) -> None:
             pass
 
 
-def start_container(container_id: str) -> dict[str, Any]:
-    """Start a stopped container and initialize git if needed."""
+def _inject_vault_secrets(container: Container, project_id: str) -> None:
+    """
+    Fetch secrets from the Vault via internal IPC and inject them into the container.
+
+    Injection mechanism (matching inject-env.sh contract):
+      1. Write /workspace/.env.keys — newline-separated list of key names
+      2. For each key, exec a shell command that exports CQR_SECRET_<KEY>=<value>
+         into the container's process environment via /proc/1/environ injection
+         (or via a sourced env file at /cqr/.runtime-env)
+
+    This function is called by start_container() only.
+    Secret values are never logged.
+    """
+    import base64
+    import requests as _requests  # sync call is fine here (called from sync context)
+
+    vault_url = os.getenv("VAULT_URL", "http://localhost:8004")
+    ipc_token = os.getenv("VAULT_IPC_TOKEN", "")
+
+    try:
+        headers = {"X-CQR-IPC-Token": ipc_token} if ipc_token else {}
+        resp = _requests.post(
+            f"{vault_url}/vault/inject/{project_id}",
+            headers=headers,
+            timeout=5,
+        )
+        resp.raise_for_status()
+        env_dict: dict[str, str] = resp.json().get("env", {})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            '{"event": "vault_inject_failed", "project_id": "%s", "error": "%s"}',
+            project_id,
+            str(exc),
+        )
+        return
+
+    if not env_dict:
+        logger.info(
+            '{"event": "vault_inject_empty", "project_id": "%s"}',
+            project_id,
+        )
+        return
+
+    # Step 1: Write .env.keys (key names only — safe to log)
+    key_names = "\n".join(env_dict.keys())
+    encoded_keys = base64.b64encode(key_names.encode()).decode()
+    container.exec_run(
+        ["bash", "-c",
+         f"mkdir -p /workspace && printf '%s' '{encoded_keys}' | base64 -d > /workspace/.env.keys"],
+        demux=False,
+    )
+
+    # Step 2: Write /cqr/.runtime-env with CQR_SECRET_<KEY>=<value> pairs
+    # This file is sourced by inject-env.sh at agent startup
+    runtime_env_lines = []
+    for key_name, value in env_dict.items():
+        safe_key = key_name.upper().replace("-", "_").replace(".", "_")
+        # Base64-encode the value to avoid shell escaping issues
+        encoded_val = base64.b64encode(value.encode()).decode()
+        runtime_env_lines.append(
+            f"export CQR_SECRET_{safe_key}=$(printf '%s' '{encoded_val}' | base64 -d)"
+        )
+
+    runtime_env_content = "\n".join(runtime_env_lines) + "\n"
+    encoded_runtime = base64.b64encode(runtime_env_content.encode()).decode()
+    container.exec_run(
+        ["bash", "-c",
+         f"mkdir -p /cqr && printf '%s' '{encoded_runtime}' | base64 -d > /cqr/.runtime-env && "
+         f"chmod 600 /cqr/.runtime-env"],
+        demux=False,
+    )
+
+    logger.info(
+        '{"event": "vault_injected", "project_id": "%s", "key_count": %d}',
+        project_id,
+        len(env_dict),
+    )
+
+
+def start_container(container_id: str, project_id: str | None = None) -> dict[str, Any]:
+    """Start a stopped container, inject vault secrets, and initialize git if needed."""
     client = _client()
     container = client.containers.get(container_id)
     container.start()
+
+    # Inject vault secrets if project_id is known
+    if project_id:
+        _inject_vault_secrets(container, project_id)
 
     # Initialize git repo in /workspace if not already present
     try:

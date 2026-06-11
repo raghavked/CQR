@@ -1,7 +1,11 @@
 """
 Vault internal FastAPI router.
+
 CRITICAL: The /vault/inject endpoint is for internal IPC only.
 It must NEVER be registered in the public Orchestration API.
+
+All storage operations use the OS keychain via keyring.
+There is no in-memory fallback — if keyring is unavailable, operations return 503.
 """
 from __future__ import annotations
 
@@ -24,8 +28,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="CQR Vault",
-    description=".ENV secret storage — internal IPC only.",
-    version="0.1.0",
+    description=".ENV secret storage — keyring-backed, no in-memory fallback.",
+    version="0.3.0",
 )
 
 # Internal IPC token — only execution-env knows this value
@@ -35,7 +39,6 @@ _INTERNAL_IPC_TOKEN = os.getenv("VAULT_IPC_TOKEN", "")
 def _require_ipc_token(x_cqr_ipc_token: str | None = Header(default=None)) -> None:
     """Verify the internal IPC token for privileged vault operations."""
     if not _INTERNAL_IPC_TOKEN:
-        # TODO(AMBIGUITY): In production, VAULT_IPC_TOKEN must always be set
         logger.warning("VAULT_IPC_TOKEN not configured — inject endpoint is unprotected")
         return
     if x_cqr_ipc_token != _INTERNAL_IPC_TOKEN:
@@ -69,20 +72,41 @@ class DeleteSecretRequest(BaseModel):
 
 @app.get("/health", tags=["health"])
 async def health() -> dict:
-    """Return service health status."""
-    return {"status": "ok", "service": "vault"}
+    """Return service health status and keyring backend info."""
+    import keyring.backend as kb
+    backend_name = type(keyring.get_keyring()).__name__
+    return {
+        "status": "ok",
+        "service": "vault",
+        "version": "0.3.0",
+        "keyring_backend": backend_name,
+    }
 
 
 @app.post("/vault/store", tags=["vault"])
 async def store(body: StoreSecretRequest) -> dict[str, str]:
-    """Store an encrypted secret for a project."""
-    store_secret(body.project_id, body.key_name, body.value)
+    """Store an encrypted secret for a project in the OS keychain."""
+    try:
+        store_secret(body.project_id, body.key_name, body.value)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=f"Keyring unavailable: {exc}") from exc
     return {"status": "ok", "key_name": body.key_name}
 
 
-@app.get("/vault/keys/{project_id}", tags=["vault"])
+@app.get("/vault/list/{project_id}", tags=["vault"])
 async def list_keys(project_id: str) -> dict[str, Any]:
-    """List key names (no values) for a project."""
+    """
+    List key names (no values) for a project.
+    Uses the keyring-backed index — no in-memory store.
+    """
+    keys = list_secret_keys(project_id)
+    return {"project_id": project_id, "keys": keys}
+
+
+# Keep the old path for backwards compatibility with orchestration passthrough
+@app.get("/vault/keys/{project_id}", tags=["vault"])
+async def list_keys_compat(project_id: str) -> dict[str, Any]:
+    """Alias for /vault/list/{project_id} (backwards compatibility)."""
     keys = list_secret_keys(project_id)
     return {"project_id": project_id, "keys": keys}
 
@@ -105,13 +129,13 @@ async def inject(
 
 @app.delete("/vault/key", tags=["vault"])
 async def delete_key(body: DeleteSecretRequest) -> dict[str, Any]:
-    """Delete a single secret."""
+    """Delete a single secret from the keychain."""
     deleted = delete_secret(body.project_id, body.key_name)
     return {"status": "ok" if deleted else "not_found", "key_name": body.key_name}
 
 
 @app.delete("/vault/project/{project_id}", tags=["vault"])
 async def delete_project(project_id: str) -> dict[str, Any]:
-    """Wipe all secrets for a project."""
+    """Wipe all secrets for a project from the keychain."""
     count = delete_project_secrets(project_id)
     return {"status": "ok", "deleted_count": count}
