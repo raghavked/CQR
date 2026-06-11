@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .router import router
 from .ws import ws_router
+from .internal_security import internal_security_router
 
 # ---------------------------------------------------------------------------
 # Structured JSON logging
@@ -43,6 +44,7 @@ app.add_middleware(
 
 app.include_router(router, prefix="/api/v1")
 app.include_router(ws_router)
+app.include_router(internal_security_router)
 
 
 @app.on_event("startup")

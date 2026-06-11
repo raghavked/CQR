@@ -296,6 +296,86 @@ async def submit_task(
     return TaskStatusResponse(task=task)
 
 
+def _extract_diff_paths(diff: str) -> list[str]:
+    """
+    Parse a unified diff and return the list of modified file paths.
+    Handles both 'a/path' and bare 'path' prefixes.
+    """
+    import re as _re
+    paths: list[str] = []
+    for line in diff.splitlines():
+        m = _re.match(r'^\+\+\+ (?:b/)?(.+)$', line)
+        if m:
+            p = m.group(1).strip()
+            if p != '/dev/null':
+                paths.append(p)
+    return list(dict.fromkeys(paths))  # deduplicate preserving order
+
+
+async def _mark_agent_edits(
+    project_id: str,
+    task_id: str,
+    agent: str,
+    diff: str,
+) -> list[str]:
+    """
+    For each file path in the diff, find its KG File node and call
+    POST /kg/mark-agent-edit to create a MODIFIED_BY_AGENT edge.
+    Returns the list of modified KG node IDs.
+    """
+    paths = _extract_diff_paths(diff)
+    if not paths:
+        return []
+
+    # Fetch all File nodes for this project to find IDs by path
+    try:
+        nodes_data = await _call_internal(
+            "GET",
+            f"{KG_ENGINE_URL}/kg/nodes",
+            params={"project_id": project_id},
+        )
+    except Exception:  # noqa: BLE001
+        return []
+
+    # Build path → node_id map for File nodes
+    path_to_id: dict[str, str] = {}
+    for node in (nodes_data if isinstance(nodes_data, list) else []):
+        props = node.get("properties", {})
+        node_type = node.get("type", "")
+        if node_type == "File":
+            node_path = props.get("path") or props.get("n.path", "")
+            if node_path:
+                path_to_id[node_path] = node["id"]
+
+    modified_node_ids: list[str] = []
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for file_path in paths:
+            node_id = path_to_id.get(file_path)
+            if not node_id:
+                # Try matching by basename
+                import os as _os
+                for kp, kid in path_to_id.items():
+                    if _os.path.basename(kp) == _os.path.basename(file_path):
+                        node_id = kid
+                        break
+            if node_id:
+                try:
+                    await client.post(
+                        f"{KG_ENGINE_URL}/kg/mark-agent-edit",
+                        json={
+                            "project_id": project_id,
+                            "node_id": node_id,
+                            "task_id": task_id,
+                            "agent": agent,
+                        },
+                    )
+                    modified_node_ids.append(node_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    return modified_node_ids
+
+
 async def _run_task(
     task_id: str,
     api_key: str | None = None,
@@ -378,6 +458,19 @@ async def _run_task(
                 lines_removed=apply_result.get("lines_removed", 0),
             )
 
+        # Stage 5b: mark MODIFIED_BY_AGENT edges for all changed files
+        agent_name = row.get("agent", "claude")
+        modified_node_ids: list[str] = []
+        if agent_response.diff:
+            modified_node_ids = await _mark_agent_edits(
+                project_id, task_id, agent_name, agent_response.diff
+            )
+            logger.info(
+                '{"event": "agent_edits_marked", "task_id": "%s", "node_count": %d}',
+                task_id,
+                len(modified_node_ids),
+            )
+
         # Stage 6: re-ingest changed files into KG
         ingest_result = await _call_internal(
             "POST",
@@ -387,12 +480,23 @@ async def _run_task(
         node_ids_changed = ingest_result.get("summary", {}).get("changed_node_ids", [])
         await emit_kg_updated(project_id, node_ids_changed)
 
-        # Stage 7: run security scan on modified nodes
-        scan_result = await _call_internal(
-            "POST",
-            f"{SECURITY_SCANNER_URL}/security/scan",
-            json={"project_id": project_id, "task_id": task_id},
-        )
+        # Stage 7: run security scan — targeted on modified nodes if available, else full
+        if modified_node_ids:
+            scan_result = await _call_internal(
+                "POST",
+                f"{SECURITY_SCANNER_URL}/security/scan-nodes",
+                json={
+                    "project_id": project_id,
+                    "node_ids": modified_node_ids,
+                    "task_id": task_id,
+                },
+            )
+        else:
+            scan_result = await _call_internal(
+                "POST",
+                f"{SECURITY_SCANNER_URL}/security/scan",
+                json={"project_id": project_id, "task_id": task_id},
+            )
         # Emit security.alert for every HIGH or CRITICAL finding
         for finding in scan_result.get("findings", []):
             if finding.get("severity", "").lower() in ("high", "critical"):

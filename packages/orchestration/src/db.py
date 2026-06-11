@@ -168,3 +168,168 @@ async def update_task(task_id: str, **fields: Any) -> None:
             {"id": task_id, **fields},
         )
         await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Security findings and scan history CRUD (CP-4)
+# ---------------------------------------------------------------------------
+
+
+async def store_scan_results(
+    scan_id: str,
+    project_id: str,
+    findings: list[dict[str, Any]],
+    task_id: str | None = None,
+    node_count: int = 0,
+    edge_count: int = 0,
+) -> None:
+    """
+    Persist a full scan result set to Postgres.
+    Inserts one row into security_scan_history and one row per finding into
+    security_findings. Both tables are keyed by scan_id for correlation.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    critical_count = sum(1 for f in findings if f.get("severity", "").upper() == "CRITICAL")
+    high_count = sum(1 for f in findings if f.get("severity", "").upper() == "HIGH")
+
+    async with AsyncSessionLocal() as session:
+        # Insert scan history row
+        await session.execute(
+            text(
+                """
+                INSERT INTO security_scan_history
+                    (id, scan_id, project_id, task_id, findings_count,
+                     critical_count, high_count, node_count, edge_count, scanned_at)
+                VALUES
+                    (:id, :scan_id, :project_id, :task_id, :findings_count,
+                     :critical_count, :high_count, :node_count, :edge_count, :scanned_at)
+                """
+            ),
+            {
+                "id": str(_uuid.uuid4()),
+                "scan_id": scan_id,
+                "project_id": project_id,
+                "task_id": task_id,
+                "findings_count": len(findings),
+                "critical_count": critical_count,
+                "high_count": high_count,
+                "node_count": node_count,
+                "edge_count": edge_count,
+                "scanned_at": datetime.utcnow(),
+            },
+        )
+
+        # Insert individual findings
+        for finding in findings:
+            node_path = finding.get("node_path", [])
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO security_findings
+                        (id, project_id, task_id, scan_id, pattern, severity,
+                         description, suggested_fix, node_path,
+                         source_node_id, sink_node_id, created_at)
+                    VALUES
+                        (:id, :project_id, :task_id, :scan_id, :pattern, :severity,
+                         :description, :suggested_fix, :node_path,
+                         :source_node_id, :sink_node_id, :created_at)
+                    """
+                ),
+                {
+                    "id": str(_uuid.uuid4()),
+                    "project_id": project_id,
+                    "task_id": task_id,
+                    "scan_id": scan_id,
+                    "pattern": finding.get("pattern", "unknown"),
+                    "severity": finding.get("severity", "LOW"),
+                    "description": finding.get("description"),
+                    "suggested_fix": finding.get("suggested_fix"),
+                    "node_path": _json.dumps(node_path),
+                    "source_node_id": node_path[0] if node_path else None,
+                    "sink_node_id": node_path[-1] if len(node_path) > 1 else None,
+                    "created_at": datetime.utcnow(),
+                },
+            )
+
+        await session.commit()
+
+
+async def get_latest_findings(project_id: str) -> list[dict[str, Any]]:
+    """
+    Return the findings from the most recent scan for a project.
+    Each finding includes node_path as a Python list (deserialized from JSONB).
+    """
+    import json as _json
+
+    async with AsyncSessionLocal() as session:
+        # Find the most recent scan_id for this project
+        result = await session.execute(
+            text(
+                """
+                SELECT scan_id FROM security_scan_history
+                WHERE project_id = :pid
+                ORDER BY scanned_at DESC
+                LIMIT 1
+                """
+            ),
+            {"pid": project_id},
+        )
+        row = result.mappings().first()
+        if not row:
+            return []
+
+        scan_id = row["scan_id"]
+
+        # Fetch all findings for that scan
+        result = await session.execute(
+            text(
+                """
+                SELECT * FROM security_findings
+                WHERE scan_id = :scan_id
+                ORDER BY severity DESC, created_at ASC
+                """
+            ),
+            {"scan_id": scan_id},
+        )
+        findings = []
+        for r in result.mappings().all():
+            f = dict(r)
+            # Deserialize node_path from JSONB string
+            if isinstance(f.get("node_path"), str):
+                try:
+                    f["node_path"] = _json.loads(f["node_path"])
+                except Exception:  # noqa: BLE001
+                    f["node_path"] = []
+            # Ensure UUIDs are strings
+            for k in ("id", "project_id", "task_id"):
+                if f.get(k) is not None:
+                    f[k] = str(f[k])
+            findings.append(f)
+        return findings
+
+
+async def get_scan_history_db(project_id: str) -> list[dict[str, Any]]:
+    """
+    Return all scan history entries for a project, most recent first.
+    """
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            text(
+                """
+                SELECT * FROM security_scan_history
+                WHERE project_id = :pid
+                ORDER BY scanned_at DESC
+                """
+            ),
+            {"pid": project_id},
+        )
+        rows = []
+        for r in result.mappings().all():
+            row = dict(r)
+            for k in ("id", "project_id", "task_id"):
+                if row.get(k) is not None:
+                    row[k] = str(row[k])
+            rows.append(row)
+        return rows

@@ -1,13 +1,15 @@
 """
 Security Scanner internal FastAPI router.
 
+CP-4: findings and scan history are now persisted in Postgres via the
+Orchestration internal endpoint. get_findings() and get_scan_history()
+are now async.
+
 Implements all four endpoints from PDR Section 10.2:
   POST /security/scan           — Full project scan via KG path traversal
   POST /security/scan-nodes     — Targeted scan on specific node IDs (post-agent-edit)
   GET  /security/report/{id}    — Latest findings with paths, severities, suggested fixes
   GET  /security/history/{id}   — Scan history over time
-
-All scan results are produced by graph path traversal — not regex matching.
 """
 from __future__ import annotations
 
@@ -29,7 +31,7 @@ app = FastAPI(
         "Detects unvalidated taint flows, hardcoded credentials, orphaned imports, "
         "and circular dependencies via directed graph walks over the Knowledge Graph."
     ),
-    version="0.2.0",
+    version="0.4.0",
 )
 
 
@@ -40,7 +42,6 @@ app = FastAPI(
 
 class ScanRequest(BaseModel):
     """Request body for POST /security/scan."""
-
     project_id: str
     task_id: str | None = None
 
@@ -51,7 +52,6 @@ class ScanNodesRequest(BaseModel):
     Used after agent edits to re-scan only the affected nodes and their
     2-hop neighbourhood, avoiding a full project re-scan.
     """
-
     project_id: str
     node_ids: list[str]
     task_id: str | None = None
@@ -65,7 +65,7 @@ class ScanNodesRequest(BaseModel):
 @app.get("/health", tags=["health"])
 async def health() -> dict:
     """Return service health status."""
-    return {"status": "ok", "service": "security-scanner", "version": "0.2.0"}
+    return {"status": "ok", "service": "security-scanner", "version": "0.4.0"}
 
 
 @app.post("/security/scan", tags=["security"])
@@ -81,7 +81,8 @@ async def trigger_scan(body: ScanRequest) -> dict[str, Any]:
        passing through a validation node.
     4. Runs structural checks: hardcoded credentials, orphaned imports,
        circular import cycles.
-    5. Returns all findings with full node_path arrays.
+    5. Persists findings to Postgres via Orchestration internal endpoint.
+    6. Returns all findings with full node_path arrays.
     """
     findings = await scan_project(body.project_id, body.task_id)
     return {
@@ -98,6 +99,7 @@ async def trigger_node_scan(body: ScanNodesRequest) -> dict[str, Any]:
     Run a targeted scan on a specific set of KG node IDs and their 2-hop
     neighbourhood. Called automatically by the Orchestration layer after
     every agent edit to provide fast incremental security feedback.
+    Findings are persisted to Postgres.
     """
     if not body.node_ids:
         raise HTTPException(status_code=400, detail="node_ids must not be empty")
@@ -115,11 +117,11 @@ async def trigger_node_scan(body: ScanNodesRequest) -> dict[str, Any]:
 @app.get("/security/report/{project_id}", tags=["security"])
 async def get_report(project_id: str) -> dict[str, Any]:
     """
-    Return the latest stored security findings for a project.
+    Return the latest stored security findings for a project from Postgres.
     Each finding includes the full node_path (ordered list of KG node IDs
     from source to sink), severity, description, and suggested fix.
     """
-    findings = get_findings(project_id)
+    findings = await get_findings(project_id)
     return {
         "project_id": project_id,
         "findings": findings,
@@ -131,11 +133,11 @@ async def get_report(project_id: str) -> dict[str, Any]:
 @app.get("/security/history/{project_id}", tags=["security"])
 async def get_history(project_id: str) -> dict[str, Any]:
     """
-    Return the scan history for a project.
+    Return the scan history for a project from Postgres.
     Each entry contains the timestamp, finding count, task ID, and
     node/edge counts at the time of the scan. Used for trend views in the UI.
     """
-    history = get_scan_history(project_id)
+    history = await get_scan_history(project_id)
     return {
         "project_id": project_id,
         "history": history,
