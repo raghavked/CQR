@@ -178,8 +178,12 @@ def _parse_python_treesitter(source: str, file_path: str, parser: Any) -> dict[s
     classes: list[dict] = []
     imports: list[dict] = []
     env_refs: list[dict] = []
+    call_sites: list[dict] = []  # {caller_name, callee_name, line}
 
-    def walk(node: Any) -> None:
+    # Track the current enclosing function for call site attribution
+    _current_function: list[str] = []
+
+    def walk(node: Any, enclosing_fn: str = "") -> None:
         if node.type == "function_definition":
             name_node = node.child_by_field_name("name")
             name = (
@@ -202,6 +206,10 @@ def _parse_python_treesitter(source: str, file_path: str, parser: Any) -> dict[s
                     "docstring": _extract_docstring(node, source_bytes),
                 }
             )
+            # Walk the function body with this function as the enclosing context
+            for child in node.children:
+                walk(child, enclosing_fn=name)
+            return  # Already walked children
         elif node.type == "class_definition":
             name_node = node.child_by_field_name("name")
             name = (
@@ -258,13 +266,29 @@ def _parse_python_treesitter(source: str, file_path: str, parser: Any) -> dict[s
             )
         elif node.type == "call":
             raw = source_bytes[node.start_byte:node.end_byte].decode()
+            # EnvRef detection
             for match in _PY_ENVREF_RE.finditer(raw):
                 key = match.group("key") or match.group("key2")
                 line = node.start_point[0] + 1
                 env_refs.append({"key_name": key, "file_path": file_path, "line": line})
+            # Call site extraction: record caller→callee relationship
+            if enclosing_fn:
+                fn_node = node.child_by_field_name("function")
+                if fn_node:
+                    callee_raw = source_bytes[fn_node.start_byte:fn_node.end_byte].decode()
+                    # Extract the base name (e.g. "cursor.execute" → "execute", "get_user" → "get_user")
+                    callee_name = callee_raw.split(".")[-1].strip()
+                    if callee_name and callee_name.isidentifier():
+                        call_sites.append({
+                            "caller_name": enclosing_fn,
+                            "callee_name": callee_name,
+                            "callee_full": callee_raw,
+                            "file_path": file_path,
+                            "line": node.start_point[0] + 1,
+                        })
 
         for child in node.children:
-            walk(child)
+            walk(child, enclosing_fn=enclosing_fn)
 
     walk(root)
     return {
@@ -272,6 +296,7 @@ def _parse_python_treesitter(source: str, file_path: str, parser: Any) -> dict[s
         "classes": classes,
         "imports": imports,
         "env_refs": env_refs,
+        "call_sites": call_sites,
         "variables": [],
     }
 

@@ -126,6 +126,25 @@ async def _fetch_nodes_by_ids(
 # ---------------------------------------------------------------------------
 
 
+def _normalise_nodes(nodes: list[dict]) -> list[dict]:
+    """
+    Normalise KG node property keys returned by Kuzu.
+    Kuzu prefixes all property names with 'n.' (e.g. 'n.name', 'n.signature').
+    The traversal engine expects un-prefixed keys ('name', 'signature').
+    This function strips the 'n.' prefix from all property keys.
+    """
+    normalised = []
+    for node in nodes:
+        n2 = dict(node)
+        raw_props = node.get("properties", {})
+        n2["properties"] = {
+            k[2:] if k.startswith("n.") else k: v
+            for k, v in raw_props.items()
+        }
+        normalised.append(n2)
+    return normalised
+
+
 def _run_scan(
     project_id: str,
     nodes: list[dict],
@@ -137,6 +156,9 @@ def _run_scan(
     Returns a list of SecurityFinding dicts.
     """
     findings: list[dict[str, Any]] = []
+
+    # Normalise node property keys (strip Kuzu's 'n.' prefix)
+    nodes = _normalise_nodes(nodes)
 
     # --- Pass 1: Path traversal (taint flow analysis) ---
     traversal_results = scan_graph(nodes, edges)

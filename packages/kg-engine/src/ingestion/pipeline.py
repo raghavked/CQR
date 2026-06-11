@@ -97,11 +97,45 @@ def ingest_project(project_id: str, repo_path: str) -> dict[str, Any]:
                     imp_id = upsert_import_node(conn, project_id, imp)
                     summary["imports"] += 1
 
-                # Env refs
+                # Env refs — also create REFERENCES_ENV edges from enclosing function if known
                 for ref in structure.get("env_refs", []):
                     ref_id = upsert_env_ref_node(conn, project_id, ref)
                     changed_node_ids.append(ref_id)
                     summary["env_refs"] += 1
+                    # Link the file to the env ref for structural queries
+                    add_edge(conn, "CONTAINS", file_node_id, ref_id)
+
+                # Build a name→id lookup for functions in this file for CALLS edges
+                fn_name_to_id: dict[str, str] = {}
+                for fn in structure.get("functions", []):
+                    from ..graph.crud import _node_id as _nid
+                    fid = _nid("Function", project_id, fn["file_path"], fn["name"], str(fn.get("start_line", 0)))
+                    fn_name_to_id[fn["name"]] = fid
+
+                # Call sites — create CALLS edges between Function nodes
+                # For cross-file calls, we create a synthetic sink Function node
+                # representing the callee by name (for taint-flow traversal)
+                for cs in structure.get("call_sites", []):
+                    caller_id = fn_name_to_id.get(cs["caller_name"])
+                    if not caller_id:
+                        continue
+                    callee_name = cs["callee_name"]
+                    callee_full = cs.get("callee_full", callee_name)
+                    # Look up callee in same file first
+                    callee_id = fn_name_to_id.get(callee_name)
+                    if not callee_id:
+                        # Create a synthetic Function node for the callee
+                        # (captures stdlib/external calls like cursor.execute)
+                        synthetic_fn = {
+                            "name": callee_name,
+                            "file_path": file_path,
+                            "start_line": cs.get("line", 0),
+                            "end_line": cs.get("line", 0),
+                            "signature": callee_full,
+                            "docstring": "",
+                        }
+                        callee_id = upsert_function_node(conn, project_id, synthetic_fn)
+                    add_edge(conn, "CALLS", caller_id, callee_id)
 
             except Exception as exc:  # noqa: BLE001
                 logger.error("Error ingesting file %s: %s", file_path, exc)

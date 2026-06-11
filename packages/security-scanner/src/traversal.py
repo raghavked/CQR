@@ -97,9 +97,10 @@ _VALIDATION_NAMES = re.compile(
 # ---------------------------------------------------------------------------
 
 _USER_INPUT_NAMES = re.compile(
-    r"\b(parse|read|get|from_request|handle|receive|accept|load|fetch|"
-    r"deserializ|decode|input|request|form|body|param|arg|argv)\b",
-    re.IGNORECASE,
+    r"(?i)\b(parse|read|get|from_request|handle|receive|accept|load|fetch|"
+    r"deserializ|decode|input|request|form|body|param|arg|argv|"
+    r"query|search|lookup|find|retrieve|process|run|execute_query|do_query|"
+    r"user_input|raw_input|stdin)(?:\b|_)",
 )
 
 # Maximum hop depth for path traversal

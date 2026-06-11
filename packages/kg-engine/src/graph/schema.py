@@ -112,11 +112,17 @@ EDGE_SCHEMAS = [
 
 
 def get_db_path(project_id: str) -> Path:
-    """Return the filesystem path for a project's Kuzu database."""
+    """
+    Return the filesystem path for a project's Kuzu database.
+
+    Kuzu 0.11+ requires a FILE path, not a directory path.
+    The database is stored as a single file at <base>/<project_id>.kuzu
+    The parent directory is created if it does not exist.
+    """
     base = os.getenv("KG_DB_BASE_PATH", "/tmp/cqr-kg")
-    db_path = Path(base) / project_id
-    db_path.mkdir(parents=True, exist_ok=True)
-    return db_path
+    parent = Path(base)
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent / f"{project_id}.kuzu"
 
 
 def get_connection(project_id: str) -> kuzu.Connection:

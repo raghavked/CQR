@@ -403,7 +403,8 @@ def get_all_edges(conn: kuzu.Connection, project_id: str) -> list[dict[str, Any]
     Covers CALLS, IMPORTS, DEFINES, REFERENCES, and MODIFIED_BY_AGENT edges.
     """
     all_edges: list[dict[str, Any]] = []
-    edge_types = ("CALLS", "IMPORTS", "DEFINES", "REFERENCES", "MODIFIED_BY_AGENT")
+    # Only query edge types that exist in the schema (see schema.py EDGE_SCHEMAS)
+    edge_types = ("CONTAINS", "CALLS", "IMPORTS", "INHERITS", "REFERENCES_ENV", "MODIFIED_BY_AGENT")
     for edge_type in edge_types:
         try:
             result = conn.execute(
