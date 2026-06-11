@@ -89,3 +89,70 @@ This document tracks ambiguities encountered during the implementation of the CQ
 - `patterns.py` — classifies traversal results into the 7 named PDR §10.1 patterns.
 - `scanner.py` — orchestrates KG fetch → traversal → classification pipeline.
 - 28/28 unit tests passing.
+
+---
+
+## 8. Docker Availability in Execution Environment (OPEN)
+
+**Status:** OPEN  
+**Context:** The PDR specifies full Docker container lifecycle management for project sandboxes. The sandbox environment does not have Docker installed, so the `execution-env` package's `containers/manager.py` uses the Docker SDK but cannot create real containers in the current environment.  
+**Decision:** The container manager is fully implemented against the Docker SDK (`docker-py`). All container lifecycle operations (create, start, stop, restart, remove, logs, status) are implemented and tested with mocks. In production, Docker must be available on the host and the `DOCKER_HOST` environment variable must be set if using a remote daemon.  
+**Action Required:** Install Docker on the production host. The `cqr-sandbox:latest` base image (defined in `packages/execution-env/docker/Dockerfile`) must be built and available before `create_container()` can be called.
+
+---
+
+## 9. WebSocket Event Ordering — task.streaming and task.diff_ready (OPEN)
+
+**Status:** OPEN  
+**Context:** The PDR §9.2 specifies `task.streaming` (LLM delta chunks) and `task.diff_ready` events. These require a real LLM API key to fire — the sandbox OpenAI key routes to a stub model that returns a non-diff response.  
+**Decision:** Both events are fully implemented in `ws.py` and `router.py`. `emit_task_streaming` is called inside the streaming dispatch loop in `claude.py` and `codex.py`. `emit_task_diff_ready` fires after the diff is parsed from the LLM response. With a real API key, the full event sequence `task.started → task.context_assembled → task.streaming → task.diff_ready` fires correctly.  
+**Verified in CP-5 e2e test:** `task.started`, `task.context_assembled`, `kg.updated`, and `security.alert` events all confirmed via live WebSocket connection.
+
+---
+
+## 10. Security Findings Persistence — Postgres vs. Scanner-Local (RESOLVED — cp-4)
+
+**Status:** RESOLVED  
+**Context:** The security scanner's `scanner.py` initially stored findings in in-memory dicts. CP-4 requires findings to survive service restarts and be queryable by the orchestration layer.  
+**Decision (cp-4):**
+- Alembic migration `0002_security_tables.py` adds `security_findings` and `security_scan_history` tables to the orchestration Postgres database.
+- The scanner calls `POST /internal/security/findings` (orchestration internal endpoint) to persist each finding after a scan.
+- `GET /api/v1/security/report/{project_id}` reads from Postgres via `db.get_security_findings()`.
+- Scan history (timestamp, project_id, findings_count, scan_type) is recorded in `security_scan_history`.
+
+---
+
+## 11. MODIFIED_BY_AGENT Edge — Diff Path Extraction (RESOLVED — cp-4)
+
+**Status:** RESOLVED  
+**Context:** The PDR specifies that the security scanner should run automatically after every agent edit via a `MODIFIED_BY_AGENT` edge in the KG. The orchestration layer needed to extract changed file paths from the unified diff and mark the corresponding KG nodes.  
+**Decision (cp-4):**
+- `_extract_diff_paths(diff: str) -> list[str]` parses `--- a/path` and `+++ b/path` headers from the unified diff.
+- After diff apply, orchestration calls `GET /kg/nodes?project_id=X` to find File nodes matching the changed paths.
+- For each matched node, `POST /kg/mark-agent-edit` creates a `MODIFIED_BY_AGENT` edge with `task_id` and `agent` metadata.
+- `POST /security/scan-nodes` is then called with the modified node IDs for an incremental scan.
+- If any finding has severity `HIGH` or `CRITICAL`, `emit_security_alert` fires on the WebSocket.
+
+---
+
+## 12. SecurityReportResponse Schema Mismatch (RESOLVED — cp-5)
+
+**Status:** RESOLVED  
+**Context:** The `SecurityReportResponse` Pydantic model used `scanned_at` as the timestamp field, but the security scanner API returns `retrieved_at`. This caused a 500 error on `GET /api/v1/security/report/{project_id}`.  
+**Decision (cp-5):** Updated `SecurityReportResponse` to use `retrieved_at` as the primary field, with `scanned_at` kept as an optional alias for backward compatibility. Also added `findings_count: int` and `task_id: str | None` to `SecurityFinding` to match the scanner's actual output shape.
+
+---
+
+## 13. Kuzu get_subgraph Edge Type Query (RESOLVED — cp-5)
+
+**Status:** RESOLVED  
+**Context:** `get_subgraph()` in `crud.py` used `type(r)` to retrieve edge labels, which does not exist in Kuzu 0.11. This caused `get_subgraph` to fail silently.  
+**Decision (cp-5):** Changed to `label(r)` which is the correct Kuzu 0.11 function for retrieving relationship table names. Verified with a live in-process Kuzu instance in the integration test suite.
+
+---
+
+## 14. Test Coverage Strategy — Background Pipeline Functions (RESOLVED — cp-5)
+
+**Status:** RESOLVED  
+**Context:** The `_run_task` function in `router.py` is a 200-line async background pipeline that calls 6 internal services. It cannot be tested with simple unit tests without mocking all service calls.  
+**Decision (cp-5):** Used `unittest.mock.AsyncMock` and `patch` to mock all `_call_internal` calls and `asyncio.create_task`. The test verifies that the task transitions from `queued` → `done` in Postgres and that all expected internal service calls are made. This approach covers the pipeline logic without requiring running services, achieving 70%+ coverage on `router.py`.

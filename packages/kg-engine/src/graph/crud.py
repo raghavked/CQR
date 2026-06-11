@@ -300,7 +300,7 @@ def get_subgraph(
             """
             MATCH (a {id: $id})-[r]->(b)
             WHERE b.id IN $ids
-            RETURN a.id, type(r), b.id
+            RETURN a.id, label(r), b.id
             """,
             {"id": nid, "ids": list(visited)},
         )

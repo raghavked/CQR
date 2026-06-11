@@ -13,6 +13,7 @@ import logging
 import os
 from typing import Any
 
+import keyring
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
@@ -73,7 +74,6 @@ class DeleteSecretRequest(BaseModel):
 @app.get("/health", tags=["health"])
 async def health() -> dict:
     """Return service health status and keyring backend info."""
-    import keyring.backend as kb
     backend_name = type(keyring.get_keyring()).__name__
     return {
         "status": "ok",

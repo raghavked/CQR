@@ -100,6 +100,7 @@ class SecurityFinding(BaseModel):
     suggested_fix: str | None = None
     detected_at: datetime = Field(default_factory=datetime.utcnow)
     resolved: bool = False
+    task_id: str | None = None  # Task that triggered this finding (if via MODIFIED_BY_AGENT)
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +146,10 @@ class SecurityReportResponse(BaseModel):
 
     project_id: str
     findings: list[SecurityFinding]
-    scanned_at: datetime
+    findings_count: int = 0
+    retrieved_at: datetime = Field(default_factory=datetime.utcnow)
+    # scanned_at is an alias kept for backward compatibility
+    scanned_at: datetime | None = None
 
 
 # ---------------------------------------------------------------------------

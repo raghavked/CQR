@@ -55,11 +55,16 @@ class ConnectionManager:
     async def broadcast(self, project_id: str, event: dict[str, Any]) -> None:
         """Broadcast a typed event to all connections for a project."""
         connections = list(self._connections.get(project_id, []))
+        logger.info(
+            '{"event": "broadcast", "project_id": "%s", "event_type": "%s", "conn_count": %d}',
+            project_id, event.get("event", "?"), len(connections)
+        )
         dead: list[WebSocket] = []
         for ws in connections:
             try:
                 await ws.send_text(json.dumps(event, default=str))
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                logger.warning('{"event": "broadcast_error", "error": "%s"}', str(exc))
                 dead.append(ws)
         for ws in dead:
             self.disconnect(project_id, ws)
