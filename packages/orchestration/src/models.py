@@ -118,6 +118,11 @@ class SubmitTaskRequest(BaseModel):
     description: str
     agent: Literal["claude", "codex", "cqr-native"] = "claude"
     budget_tier: Literal["micro", "standard", "extended"] = "standard"
+    # User-supplied API key — CQR never stores platform keys at rest.
+    # The key is forwarded to the Agent Bridge at call time only and
+    # destroyed after the dispatch completes. Never logged.
+    api_key: str | None = None
+    api_key_type: Literal["anthropic", "openai"] | None = None
 
 
 class TaskStatusResponse(BaseModel):
@@ -155,6 +160,10 @@ class DispatchPayload(BaseModel):
     budget_tier: Literal["micro", "standard", "extended"] = "standard"
     kg_context: KGSubgraph | None = None
     vault_keys: list[str] = Field(default_factory=list)
+    # User-supplied API key — forwarded from SubmitTaskRequest.
+    # Never stored, never logged, never passed to KG/LSM/Vault.
+    api_key: str | None = None
+    api_key_type: Literal["anthropic", "openai"] | None = None
 
 
 class AgentResponse(BaseModel):

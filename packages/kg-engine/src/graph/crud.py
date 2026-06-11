@@ -33,6 +33,11 @@ def _node_id(node_type: str, project_id: str, *parts: str) -> str:
 def upsert_file_node(conn: kuzu.Connection, project_id: str, props: dict[str, Any]) -> str:
     """Insert or update a File node; returns the node ID."""
     node_id = _node_id("File", project_id, props["path"])
+    # raw_token_count: use stored value if provided, else estimate from content length
+    raw_token_count = props.get("raw_token_count")
+    if raw_token_count is None:
+        content = props.get("content", "")
+        raw_token_count = len(content) // 4  # 1 token ≈ 4 chars
     conn.execute(
         """
         MERGE (f:File {id: $id})
@@ -40,6 +45,7 @@ def upsert_file_node(conn: kuzu.Connection, project_id: str, props: dict[str, An
             f.language = $language,
             f.last_modified = $last_modified,
             f.hash = $hash,
+            f.raw_token_count = $raw_token_count,
             f.project_id = $project_id
         """,
         {
@@ -48,6 +54,7 @@ def upsert_file_node(conn: kuzu.Connection, project_id: str, props: dict[str, An
             "language": props.get("language", "unknown"),
             "last_modified": props.get("last_modified", 0.0),
             "hash": props.get("hash", ""),
+            "raw_token_count": int(raw_token_count),
             "project_id": project_id,
         },
     )
@@ -152,14 +159,57 @@ def upsert_env_ref_node(conn: kuzu.Connection, project_id: str, props: dict[str,
     return node_id
 
 
+# Edge existence cache: (from_id, to_id, edge_type) → True
+# Prevents duplicate edge queries on the same connection within a single ingestion run.
+_edge_cache: set[tuple[str, str, str]] = set()
+
+
+def clear_edge_cache() -> None:
+    """Clear the in-process edge deduplication cache. Call between ingestion runs."""
+    _edge_cache.clear()
+
+
 def add_edge(conn: kuzu.Connection, edge_type: str, from_id: str, to_id: str) -> None:
-    """Create a directed edge between two nodes if it does not already exist."""
-    # TODO(AMBIGUITY): Kuzu MERGE on rel tables may differ by version — using CREATE for now
+    """
+    Create a directed edge between two nodes if it does not already exist.
+
+    Idempotency strategy (Correction 4 / PDR §5.3):
+      Kuzu does not support MERGE on relationship tables in all versions.
+      We implement idempotency with a two-step check-then-create:
+        1. Check the in-process cache (fast path — avoids DB round-trip for
+           edges already created in this ingestion run).
+        2. Query the DB to check for an existing edge (handles re-ingestion
+           of a project that was previously ingested).
+        3. Only CREATE if no existing edge is found.
+    """
+    cache_key = (from_id, to_id, edge_type)
+    if cache_key in _edge_cache:
+        return
+
+    try:
+        # Step 1: check whether the edge already exists in the DB
+        check = conn.execute(
+            f"""
+            MATCH (a {{id: $from_id}})-[r:{edge_type}]->(b {{id: $to_id}})
+            RETURN count(r) AS cnt
+            """,
+            {"from_id": from_id, "to_id": to_id},
+        )
+        if check.has_next():
+            row = check.get_next()
+            if row[0] and int(row[0]) > 0:
+                _edge_cache.add(cache_key)
+                return
+    except Exception as exc:  # noqa: BLE001
+        # If the check query fails (e.g. node type mismatch), fall through to CREATE
+        logger.debug("Edge existence check failed, proceeding with CREATE: %s", exc)
+
     try:
         conn.execute(
             f"MATCH (a {{id: $from_id}}), (b {{id: $to_id}}) CREATE (a)-[:{edge_type}]->(b)",
             {"from_id": from_id, "to_id": to_id},
         )
+        _edge_cache.add(cache_key)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Edge creation skipped (may already exist): %s", exc)
 

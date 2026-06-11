@@ -1,6 +1,11 @@
 """
 Codex (OpenAI) LLM dispatcher for the Agent Bridge.
-Supports GPT-4o and o-series models via the OpenAI SDK.
+
+API key policy:
+  The OpenAI API key is NEVER read from environment variables here.
+  It is accepted as a parameter at call time, used to instantiate the SDK
+  client for that single call, and then garbage-collected. It is never
+  assigned to a module-level variable and never logged.
 """
 from __future__ import annotations
 
@@ -59,16 +64,28 @@ def _parse_agent_response(raw: str) -> dict[str, Any]:
 async def dispatch_codex(
     messages: list[dict[str, str]],
     task_id: str,
+    api_key: str,
+    savings_vs_raw: float = 0.0,
 ) -> dict[str, Any]:
     """
-    Dispatch a prompt to OpenAI (Codex/GPT-4o) and return a structured AgentResponse dict.
+    Dispatch a prompt to OpenAI (GPT-4o) and return a structured AgentResponse dict.
+
+    Parameters
+    ----------
+    messages:
+        The prompt messages to send to the model.
+    task_id:
+        The CQR task ID (for logging — never the key).
+    api_key:
+        The user-supplied OpenAI API key. Instantiated into the SDK
+        client for this call only. Never stored or logged.
+    savings_vs_raw:
+        Pre-computed token savings percentage from the context assembler.
     """
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_API_BASE"),
-    )
+    # Key is used here and only here — client is local to this call frame
+    client = AsyncOpenAI(api_key=api_key)
 
     try:
         response = await client.chat.completions.create(
@@ -105,6 +122,6 @@ async def dispatch_codex(
             "context_tokens": input_tokens,
             "response_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
-            "savings_vs_raw": 0.0,
+            "savings_vs_raw": savings_vs_raw,
         },
     }

@@ -23,6 +23,7 @@ NODE_SCHEMAS = [
         language STRING,
         last_modified DOUBLE,
         hash STRING,
+        raw_token_count INT64,
         project_id STRING,
         PRIMARY KEY (id)
     )

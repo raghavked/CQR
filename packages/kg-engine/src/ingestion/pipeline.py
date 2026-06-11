@@ -11,6 +11,7 @@ from typing import Any
 
 from ..graph.crud import (
     add_edge,
+    clear_edge_cache,
     upsert_class_node,
     upsert_env_ref_node,
     upsert_file_node,
@@ -31,8 +32,12 @@ def ingest_project(project_id: str, repo_path: str) -> dict[str, Any]:
     """
     Ingest all supported source files in a project directory into the KG.
     Returns a summary of nodes created/updated.
+
+    The edge cache is cleared at the start of each run so that re-ingestion
+    correctly detects existing edges in the DB rather than skipping them.
     """
     conn = get_connection(project_id)
+    clear_edge_cache()  # Reset per-run deduplication cache
     summary = {"files": 0, "functions": 0, "classes": 0, "imports": 0, "env_refs": 0, "errors": 0}
     changed_node_ids: list[str] = []
 
@@ -60,7 +65,15 @@ def ingest_project(project_id: str, repo_path: str) -> dict[str, Any]:
                 continue
 
             try:
+                # Read raw content for token count calculation
+                try:
+                    raw_content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+                except Exception:  # noqa: BLE001
+                    raw_content = ""
+
                 meta = structure["file_meta"]
+                # Pass raw content so upsert_file_node can compute raw_token_count
+                meta["content"] = raw_content
                 file_node_id = upsert_file_node(conn, project_id, meta)
                 changed_node_ids.append(file_node_id)
                 summary["files"] += 1

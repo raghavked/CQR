@@ -1,6 +1,11 @@
 """
 Claude (Anthropic) LLM dispatcher for the Agent Bridge.
-Supports streaming and structured response parsing.
+
+API key policy:
+  The Anthropic API key is NEVER read from environment variables here.
+  It is accepted as a parameter at call time, used to instantiate the SDK
+  client for that single call, and then garbage-collected. It is never
+  assigned to a module-level variable and never logged.
 """
 from __future__ import annotations
 
@@ -8,7 +13,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, AsyncGenerator
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +37,10 @@ def _parse_agent_response(raw: str) -> dict[str, Any]:
     Parse agent output into structured diff + explanation.
     Agent is instructed to output: unified diff + JSON block.
     """
-    # Extract unified diff blocks
     diff_pattern = re.compile(r"(---\s+\S+.*?(?=\{\"explanation\"|$))", re.DOTALL)
     diff_match = diff_pattern.search(raw)
     diff = diff_match.group(1).strip() if diff_match else ""
 
-    # Extract JSON explanation block
     json_pattern = re.compile(r'\{[^{}]*"explanation"[^{}]*\}', re.DOTALL)
     json_match = json_pattern.search(raw)
     explanation = ""
@@ -65,13 +68,28 @@ def _parse_agent_response(raw: str) -> dict[str, Any]:
 async def dispatch_claude(
     messages: list[dict[str, str]],
     task_id: str,
+    api_key: str,
+    savings_vs_raw: float = 0.0,
 ) -> dict[str, Any]:
     """
     Dispatch a prompt to Claude and return a structured AgentResponse dict.
+
+    Parameters
+    ----------
+    messages:
+        The prompt messages to send to Claude.
+    task_id:
+        The CQR task ID (for logging — never the key).
+    api_key:
+        The user-supplied Anthropic API key. Instantiated into the SDK
+        client for this call only. Never stored or logged.
+    savings_vs_raw:
+        Pre-computed token savings percentage from the context assembler.
     """
     from anthropic import AsyncAnthropic
 
-    client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    # Key is used here and only here — client is local to this call frame
+    client = AsyncAnthropic(api_key=api_key)
 
     system_message = next((m["content"] for m in messages if m["role"] == "system"), "")
     user_messages = [m for m in messages if m["role"] != "system"]
@@ -112,6 +130,6 @@ async def dispatch_claude(
             "context_tokens": input_tokens,
             "response_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
-            "savings_vs_raw": 0.0,  # TODO(AMBIGUITY): compute actual savings vs raw file send
+            "savings_vs_raw": savings_vs_raw,
         },
     }
