@@ -24,16 +24,19 @@ class Project(BaseModel):
     repo_path: str  # Local path in execution container
     container_id: str | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
-    status: Literal["provisioning", "ready", "error"] = "provisioning"
+    status: Literal["provisioning", "ready", "error", "stopped"] = "provisioning"
 
 
 class TokenUsage(BaseModel):
     """Token consumption breakdown for a single LLM dispatch."""
 
-    context_tokens: int
-    response_tokens: int
-    total_tokens: int
-    savings_vs_raw: float  # Percentage saved vs. sending raw files
+    context_tokens: int = 0
+    response_tokens: int = 0
+    total_tokens: int = 0
+    savings_vs_raw: float = 0.0  # Percentage saved vs. sending raw files
+    prompt_tokens: int | None = None   # alias for context_tokens (OpenAI naming)
+    completion_tokens: int | None = None  # alias for response_tokens
+    context_node_count: int | None = None  # number of KG nodes in context window
 
 
 class Task(BaseModel):
@@ -44,7 +47,7 @@ class Task(BaseModel):
     description: str
     agent: Literal["claude", "codex", "cqr-native"] = "claude"
     budget_tier: Literal["micro", "standard", "extended"] = "standard"
-    status: Literal["queued", "running", "done", "failed", "rejected"] = "queued"
+    status: Literal["queued", "running", "done", "failed", "rejected", "applied"] = "queued"
     created_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: datetime | None = None
     token_usage: TokenUsage | None = None
@@ -173,7 +176,7 @@ class AgentResponse(BaseModel):
     diff: str  # Unified diff
     explanation: str
     confidence: float  # 0.0–1.0
-    token_usage: TokenUsage
+    token_usage: TokenUsage | None = None
     flagged: bool = False  # True if response attempted to access restricted paths
     flag_reason: str | None = None
 
