@@ -119,7 +119,7 @@ async function del<T>(url: string, body?: unknown): Promise<T> {
 
 export const api = {
   projects: {
-    list: () => get<Project[]>(`${ORCH}/api/v1/projects`),
+    list: () => get<{ projects: Project[] }>(`${ORCH}/api/v1/projects`),
     get: (id: string) => get<{ project: Project }>(`${ORCH}/api/v1/projects/${id}`),
     create: (name: string, repo_path: string) =>
       post<Project>(`${ORCH}/api/v1/projects`, { name, repo_path }),
