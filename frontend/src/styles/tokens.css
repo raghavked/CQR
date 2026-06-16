@@ -1,0 +1,134 @@
+/* CQR Design System — Token Layer
+ * Source of truth for all visual properties.
+ * All component styles MUST reference these tokens — no hardcoded hex values.
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap');
+
+:root {
+  /* ── Color: Base Surfaces ── */
+  --bg-base:    #080808;
+  --surface:    #111111;
+  --raised:     #1A1A1A;
+  --line:       #2A2A2A;
+
+  /* ── Color: Text ── */
+  --text:       #F0F0F0;
+  --text-muted: #8A8A8A;
+
+  /* ── Color: Status (semantic only — never decorative) ── */
+  --status-danger:  #CC4444;
+  --status-warning: #CC8833;
+  --status-success: #44AA66;
+  --status-info:    #5588CC;
+  --status-neutral: #555555;
+
+  /* ── Typography ── */
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --font-ui:   -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+
+  --type-title:   600 15px/1.4 var(--font-ui);
+  --type-body:    400 13px/1.5 var(--font-ui);
+  --type-mono-sm: 400 12px/1.4 var(--font-mono);
+  --type-label:   600 11px/1.2 var(--font-ui);
+
+  /* ── Spacing Scale ── */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+
+  /* ── Geometry ── */
+  --radius: 0;          /* Terminal aesthetic: no border-radius */
+  --border: 1px solid var(--line);
+
+  /* ── Motion ── */
+  --transition: 120ms ease;
+  --transition-state: 200ms ease;
+
+  /* ── Layout ── */
+  --rail-width: 48px;
+  --topbar-height: 40px;
+  --statusbar-height: 28px;
+}
+
+/* ── Global Reset ── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text);
+  font: var(--type-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  user-select: none;
+}
+
+/* Allow text selection in editors and data areas */
+.selectable {
+  user-select: text;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-base);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 0;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* ── Focus ── */
+:focus-visible {
+  outline: 1px solid var(--status-info);
+  outline-offset: 1px;
+}
+
+/* ── Mono utility ── */
+.mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* ── Label utility ── */
+.label {
+  font: var(--type-label);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* ── Truncate ── */
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Reduced motion ── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
